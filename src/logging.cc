@@ -519,6 +519,7 @@ class LogDestination {
                          int line,
                          const struct ::tm* tm_time,
                          const char* message,
+                         size_t prefix_len,
                          size_t message_len,
                          int32 usecs);
 
@@ -687,7 +688,8 @@ static void ColoredWriteToStderr(LogSeverity severity,
   // Avoid using cerr from this module since we may get called during
   // exit code, and cerr may be partially or fully destroyed by then.
   if (COLOR_DEFAULT == color) {
-    fwrite(message, len, 1, stderr);
+    fwrite(message, len, 1, severity > 0 ? stderr : stdout);
+    fflush(severity > 0 ? stderr : stdout);
     return;
   }
 #ifdef OS_WINDOWS
@@ -787,13 +789,14 @@ inline void LogDestination::LogToSinks(LogSeverity severity,
                                        int line,
                                        const struct ::tm* tm_time,
                                        const char* message,
+                                       size_t prefix_len,
                                        size_t message_len,
                                        int32 usecs) {
   ReaderMutexLock l(&sink_mutex_);
   if (sinks_) {
     for (int i = sinks_->size() - 1; i >= 0; i--) {
       (*sinks_)[i]->send(severity, full_filename, base_filename,
-                         line, tm_time, message, message_len, usecs);
+                         line, tm_time, message, prefix_len, message_len, usecs);
     }
   }
 }
@@ -911,7 +914,7 @@ void LogFileObject::FlushUnlocked(){
 bool LogFileObject::CreateLogfile(const string& time_pid_string) {
   string string_filename = base_filename_+filename_extension_;
   if (FLAGS_timestamp_in_logfile_name) {
-      string_filename += time_pid_string;
+      string_filename += time_pid_string + "_log.txt";
   }
   const char* filename = string_filename.c_str();
 
@@ -1475,9 +1478,8 @@ void LogMessage::SendToLog() EXCLUSIVE_LOCKS_REQUIRED(log_mutex) {
     LogDestination::LogToSinks(data_->severity_,
                                data_->fullname_, data_->basename_,
                                data_->line_, &data_->tm_time_,
-                               data_->message_text_ + data_->num_prefix_chars_,
-                               (data_->num_chars_to_log_ -
-                                data_->num_prefix_chars_ - 1),
+                               data_->message_text_, data_->num_prefix_chars_,
+                               (data_->num_chars_to_log_ - 1),
                                data_->usecs_);
   } else {
 
@@ -1493,9 +1495,8 @@ void LogMessage::SendToLog() EXCLUSIVE_LOCKS_REQUIRED(log_mutex) {
     LogDestination::LogToSinks(data_->severity_,
                                data_->fullname_, data_->basename_,
                                data_->line_, &data_->tm_time_,
-                               data_->message_text_ + data_->num_prefix_chars_,
-                               (data_->num_chars_to_log_
-                                - data_->num_prefix_chars_ - 1),
+                               data_->message_text_, data_->num_prefix_chars_,
+                               (data_->num_chars_to_log_ - 1),
                                data_->usecs_);
     // NOTE: -1 removes trailing \n
   }
@@ -1590,9 +1591,8 @@ void LogMessage::SendToSink() EXCLUSIVE_LOCKS_REQUIRED(log_mutex) {
                data_->message_text_[data_->num_chars_to_log_-1] == '\n', "");
     data_->sink_->send(data_->severity_, data_->fullname_, data_->basename_,
                        data_->line_, &data_->tm_time_,
-                       data_->message_text_ + data_->num_prefix_chars_,
-                       (data_->num_chars_to_log_ -
-                        data_->num_prefix_chars_ - 1),
+                       data_->message_text_, data_->num_prefix_chars_,
+                       (data_->num_chars_to_log_ - 1),
                        data_->usecs_);
   }
 }

@@ -1439,7 +1439,7 @@ class GOOGLE_GLOG_DLL_DECL LogSink {
   virtual void send(LogSeverity severity, const char* full_filename,
                     const char* base_filename, int line,
                     const struct ::tm* tm_time,
-                    const char* message, size_t message_len) = 0;
+                    const char* message, size_t prefix_len, size_t message_len) = 0;
 
   // Redefine this to implement waiting for
   // the sink's logging logic to complete.
