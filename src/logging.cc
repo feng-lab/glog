@@ -44,6 +44,7 @@
 #ifdef HAVE_SYS_UTSNAME_H
 # include <sys/utsname.h>  // For uname.
 #endif
+#include <time.h>
 #include <fcntl.h>
 #include <cstdio>
 #include <iostream>
@@ -58,6 +59,11 @@
 #include <vector>
 #include <errno.h>                   // for errno
 #include <sstream>
+#ifdef OS_WINDOWS
+#include "windows/dirent.h"
+#else
+#include <dirent.h> // for automatic removal of old logs
+#endif
 #include "base/commandlineflags.h"        // to get the program name
 #include "glog/logging.h"
 #include "glog/raw_logging.h"
@@ -103,9 +109,6 @@ static bool BoolFromEnv(const char *varname, bool defval) {
   return memchr("tTyY1\0", valstr[0], 6) != NULL;
 }
 
-GLOG_DEFINE_bool(timestamp_in_logfile_name,
-                 BoolFromEnv("GOOGLE_TIMESTAMP_IN_LOGFILE_NAME", true),
-                 "put a timestamp at the end of the log file name");
 GLOG_DEFINE_bool(logtostderr, BoolFromEnv("GOOGLE_LOGTOSTDERR", false),
                  "log messages go to stderr instead of logfiles");
 GLOG_DEFINE_bool(alsologtostderr, BoolFromEnv("GOOGLE_ALSOLOGTOSTDERR", false),
@@ -446,7 +449,7 @@ class LogFileObject : public base::Logger {
   int64 next_flush_time_;         // cycle count at which to flush log
 
   // Actually create a logfile using the value of base_filename_ and the
-  // optional argument time_pid_string
+  // supplied argument time_pid_string
   // REQUIRES: lock_ is held
   bool CreateLogfile(const string& time_pid_string);
 };
@@ -838,6 +841,86 @@ void LogDestination::DeleteLogDestinations() {
 
 namespace {
 
+bool IsGlogLog(const string& filename) {
+  // Check if filename matches the pattern of a glog file:
+  // "<program name>.<hostname>.<user name>.log...".
+  const int kKeywordCount = 4;
+  std::string keywords[kKeywordCount] = {
+    glog_internal_namespace_::ProgramInvocationShortName(),
+    LogDestination::hostname(),
+    MyUserName(),
+    "log"
+  };
+
+  int start_pos = 0;
+  for (int i = 0; i < kKeywordCount; i++) {
+    if (filename.find(keywords[i], start_pos) == filename.npos) {
+      return false;
+    }
+    start_pos += keywords[i].size() + 1;
+  }
+  return true;
+}
+
+bool LastModifiedOver(const string& filepath, int days) {
+  // Try to get the last modified time of this file.
+  struct stat file_stat;
+
+  if (stat(filepath.c_str(), &file_stat) == 0) {
+    // A day is 86400 seconds, so 7 days is 86400 * 7 = 604800 seconds.
+    time_t last_modified_time = file_stat.st_mtime;
+    time_t current_time = time(NULL);
+    return difftime(current_time, last_modified_time) > days * 86400;
+  }
+
+  // If failed to get file stat, don't return true!
+  return false;
+}
+
+vector<string> GetOverdueLogNames(string log_directory, int days) {
+  // The names of overdue logs.
+  vector<string> overdue_log_names;
+
+  // Try to get all files within log_directory.
+  DIR *dir;
+  struct dirent *ent;
+
+  char dir_delim = '/';
+#ifdef OS_WINDOWS
+  dir_delim = '\\';
+#endif
+
+  // If log_directory doesn't end with a slash, append a slash to it.
+  if (log_directory.at(log_directory.size() - 1) != dir_delim) {
+    log_directory += dir_delim;
+  }
+
+  if ((dir=opendir(log_directory.c_str()))) {
+    while ((ent=readdir(dir))) {
+      if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+        continue;
+      }
+      string filepath = log_directory + ent->d_name;
+      if (IsGlogLog(ent->d_name) && LastModifiedOver(filepath, days)) {
+        overdue_log_names.push_back(filepath);
+      }
+    }
+    closedir(dir);
+  }
+
+  return overdue_log_names;
+}
+
+// Is log_cleaner enabled?
+// This option can be enabled by calling google::EnableLogCleaner(days)
+bool log_cleaner_enabled_;
+int log_cleaner_overdue_days_ = 7;
+
+} // namespace
+
+
+namespace {
+
 LogFileObject::LogFileObject(LogSeverity severity,
                              const char* base_filename)
   : base_filename_selected_(base_filename != NULL),
@@ -912,54 +995,20 @@ void LogFileObject::FlushUnlocked(){
 }
 
 bool LogFileObject::CreateLogfile(const string& time_pid_string) {
-  string string_filename = base_filename_+filename_extension_;
-  if (FLAGS_timestamp_in_logfile_name) {
-      string_filename += time_pid_string + "_log.txt";
-  }
+  string string_filename = base_filename_+filename_extension_+
+                           time_pid_string + "_log.txt";
   const char* filename = string_filename.c_str();
-
-  //only write to files, create if non-existant.
-  int flags = O_WRONLY | O_CREAT;
-  if (FLAGS_timestamp_in_logfile_name) {
-    //demand that the file is unique for our timestamp (fail if it exists).
-    flags = flags | O_EXCL;
-  }
-  int fd = open(filename, flags, FLAGS_logfile_mode);
-
+  int fd = open(filename, O_WRONLY | O_CREAT | O_EXCL, FLAGS_logfile_mode);
   if (fd == -1) return false;
 #ifdef HAVE_FCNTL
   // Mark the file close-on-exec. We don't really care if this fails
   fcntl(fd, F_SETFD, FD_CLOEXEC);
-
-  // Mark the file as exclusive write access to avoid two clients logging to the
-  // same file. This applies particularly when !FLAGS_timestamp_in_logfile_name
-  // (otherwise open would fail because the O_EXCL flag on similar filename).
-  // locks are released on unlock or close() automatically, only after log is
-  // released.
-  // This will work after a fork as it is not inherited (not stored in the fd).
-  // Lock will not be lost because the file is opened with exclusive lock (write)
-  // and we will never read from it inside the process.
-  static struct flock w_lock;
-
-  w_lock.l_type = F_WRLCK;
-  w_lock.l_start = 0;
-  w_lock.l_whence = SEEK_SET;
-  w_lock.l_len = 0;
-
-  int wlock_ret = fcntl(fd, F_SETLK, &w_lock);
-  if (wlock_ret == -1) {
-      close(fd); //as we are failing already, do not check errors here
-      return false;
-  }
 #endif
 
-  //fdopen in append mode so if the file exists it will fseek to the end
   file_ = fdopen(fd, "a");  // Make a FILE*.
   if (file_ == NULL) {  // Man, we're screwed!
     close(fd);
-    if (FLAGS_timestamp_in_logfile_name) {
-      unlink(filename);  // Erase the half-baked evidence: an unusable log file, only if we just created it.
-    }
+    unlink(filename);  // Erase the half-baked evidence: an unusable log file
     return false;
   }
 
@@ -1128,7 +1177,7 @@ void LogFileObject::Write(bool force_flush,
     file_length_ += header_len;
     bytes_since_flush_ += header_len;
   }
-
+ 
   // Write to LOG file
   if ( !stop_writing ) {
     // fwrite() doesn't return an error when the disk is full, for
@@ -1178,11 +1227,20 @@ void LogFileObject::Write(bool force_flush,
       }
     }
 #endif
+    // Perform clean up for old logs
+    if (log_cleaner_enabled_) {
+      const vector<string>& dirs = GetLoggingDirectories();
+      for (size_t i = 0; i < dirs.size(); i++) {
+        vector<string> logs = GetOverdueLogNames(dirs[i], log_cleaner_overdue_days_);
+        for (size_t j = 0; j < logs.size(); j++) {
+          static_cast<void>(unlink(logs[j].c_str()));
+        }
+      }
+    }
   }
 }
 
 }  // namespace
-
 
 // Static log data space to avoid alloc failures in a LOG(FATAL)
 //
@@ -2214,6 +2272,20 @@ void ShutdownGoogleLogging() {
   LogDestination::DeleteLogDestinations();
   delete logging_directories_list;
   logging_directories_list = NULL;
+}
+
+void EnableLogCleaner(int overdue_days) {
+  log_cleaner_enabled_ = true;
+
+  // Setting overdue_days to 0 day should not be allowed!
+  // Since all logs will be deleted immediately, which will cause troubles.
+  if (overdue_days > 0) {
+    log_cleaner_overdue_days_ = overdue_days;
+  }
+}
+
+void DisableLogCleaner() {
+  log_cleaner_overdue_days_ = false;
 }
 
 _END_GOOGLE_NAMESPACE_

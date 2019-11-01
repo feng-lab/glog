@@ -330,9 +330,6 @@ typedef unsigned __int64 uint64;
   using fLS::FLAGS_##name
 #endif
 
-// Set whether appending a timestamp to the log file name
-DECLARE_bool(timestamp_in_logfile_name);
-
 // Set whether log messages go to stderr instead of logfiles
 DECLARE_bool(logtostderr);
 
@@ -524,6 +521,11 @@ GOOGLE_GLOG_DLL_DECL void ShutdownGoogleLogging();
 
 // Install a function which will be called after LOG(FATAL).
 GOOGLE_GLOG_DLL_DECL void InstallFailureFunction(void (*fail_func)());
+
+// Enable/Disable old log cleaner.
+GOOGLE_GLOG_DLL_DECL void EnableLogCleaner(int overdue_days);
+GOOGLE_GLOG_DLL_DECL void DisableLogCleaner();
+
 
 class LogSink;  // defined below
 
