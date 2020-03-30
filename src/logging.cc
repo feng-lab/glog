@@ -495,7 +495,7 @@ class LogDestination {
 
  private:
   LogDestination(LogSeverity severity, const char* base_filename);
-  ~LogDestination() { }
+  ~LogDestination();
 
   // Take a log message of a particular severity and log it to stderr
   // iff it's of a high enough severity to deserve it.
@@ -581,6 +581,13 @@ LogDestination::LogDestination(LogSeverity severity,
                                const char* base_filename)
   : fileobject_(severity, base_filename),
     logger_(&fileobject_) {
+}
+
+LogDestination::~LogDestination() {
+  if (logger_ && logger_ != &fileobject_) {
+    // Delete user-specified logger set via SetLogger().
+    delete logger_;
+  }
 }
 
 inline void LogDestination::FlushLogFilesUnsafe(int min_severity) {
@@ -1212,7 +1219,7 @@ void LogFileObject::Write(bool force_flush,
                        << setw(2) << tm_time.tm_sec << '\n'
                        << "Running on machine: "
                        << LogDestination::hostname() << '\n'
-                       << "Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu "
+                       << "Log line format: [IWEF]yyyymmdd hh:mm:ss.uuuuuu "
                        << "threadid file:line] msg" << '\n';
     const string& file_header_string = file_header_stream.str();
 
@@ -1424,11 +1431,12 @@ void LogMessage::Init(const char* file,
   data_->has_been_flushed_ = false;
 
   // If specified, prepend a prefix to each line.  For example:
-  //    I1018 160715 f5d4fbb0 logging.cc:1153]
-  //    (log level, GMT month, date, time, thread_id, file basename, line)
+  //    I20201018 160715 f5d4fbb0 logging.cc:1153]
+  //    (log level, GMT year, month, date, time, thread_id, file basename, line)
   // We exclude the thread_id for the default thread.
   if (FLAGS_log_prefix && (line != kNoLogPrefix)) {
     stream() << LogSeverityNames[severity][0]
+             << setw(4) << 1900+data_->tm_time_.tm_year
              << setw(2) << 1+data_->tm_time_.tm_mon
              << setw(2) << data_->tm_time_.tm_mday
              << ' '
@@ -1827,6 +1835,7 @@ string LogSink::ToString(LogSeverity severity, const char* file, int line,
   stream.fill('0');
 
   stream << LogSeverityNames[severity][0]
+         << setw(4) << 1900+tm_time->tm_year
          << setw(2) << 1+tm_time->tm_mon
          << setw(2) << tm_time->tm_mday
          << ' '
