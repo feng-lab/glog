@@ -525,9 +525,8 @@ class LogDestination {
                          int line,
                          const struct ::tm* tm_time,
                          const char* message,
-                         size_t prefix_len,
                          size_t message_len,
-                         int32 usecs);
+                         int32 usecs, size_t prefix_len);
 
   // Wait for all registered sinks via WaitTillSent
   // including the optional one in "data".
@@ -802,14 +801,13 @@ inline void LogDestination::LogToSinks(LogSeverity severity,
                                        int line,
                                        const struct ::tm* tm_time,
                                        const char* message,
-                                       size_t prefix_len,
                                        size_t message_len,
-                                       int32 usecs) {
+                                       int32 usecs, size_t prefix_len) {
   ReaderMutexLock l(&sink_mutex_);
   if (sinks_) {
     for (int i = sinks_->size() - 1; i >= 0; i--) {
       (*sinks_)[i]->send(severity, full_filename, base_filename,
-                         line, tm_time, message, prefix_len, message_len, usecs);
+                         line, tm_time, message, message_len, usecs, prefix_len);
     }
   }
 }
@@ -1588,9 +1586,10 @@ void LogMessage::SendToLog() EXCLUSIVE_LOCKS_REQUIRED(log_mutex) {
     LogDestination::LogToSinks(data_->severity_,
                                data_->fullname_, data_->basename_,
                                data_->line_, &data_->tm_time_,
-                               data_->message_text_, data_->num_prefix_chars_,
-                               (data_->num_chars_to_log_ - 1),
-                               data_->usecs_);
+                               data_->message_text_ + data_->num_prefix_chars_,
+                               (data_->num_chars_to_log_ -
+                                data_->num_prefix_chars_ - 1),
+                               data_->usecs_, data_->num_prefix_chars_);
   } else {
 
     // log this message to all log files of severity <= severity_
@@ -1605,9 +1604,10 @@ void LogMessage::SendToLog() EXCLUSIVE_LOCKS_REQUIRED(log_mutex) {
     LogDestination::LogToSinks(data_->severity_,
                                data_->fullname_, data_->basename_,
                                data_->line_, &data_->tm_time_,
-                               data_->message_text_, data_->num_prefix_chars_,
-                               (data_->num_chars_to_log_ - 1),
-                               data_->usecs_);
+                               data_->message_text_ + data_->num_prefix_chars_,
+                               (data_->num_chars_to_log_
+                                - data_->num_prefix_chars_ - 1),
+                               data_->usecs_, data_->num_prefix_chars_);
     // NOTE: -1 removes trailing \n
   }
 
@@ -1701,9 +1701,10 @@ void LogMessage::SendToSink() EXCLUSIVE_LOCKS_REQUIRED(log_mutex) {
                data_->message_text_[data_->num_chars_to_log_-1] == '\n', "");
     data_->sink_->send(data_->severity_, data_->fullname_, data_->basename_,
                        data_->line_, &data_->tm_time_,
-                       data_->message_text_, data_->num_prefix_chars_,
-                       (data_->num_chars_to_log_ - 1),
-                       data_->usecs_);
+                       data_->message_text_ + data_->num_prefix_chars_,
+                       (data_->num_chars_to_log_ -
+                        data_->num_prefix_chars_ - 1),
+                       data_->usecs_, data_->num_prefix_chars_);
   }
 }
 

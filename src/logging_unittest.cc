@@ -503,7 +503,7 @@ class TestLogSinkImpl : public LogSink {
   virtual void send(LogSeverity severity, const char* full_filename,
                     const char* base_filename, int line,
                     const struct tm* tm_time,
-                    const char* message, size_t, size_t message_len) {
+                    const char* message, size_t message_len) {
     send(severity, full_filename, base_filename, line,
          tm_time, message, message_len, 0);
   }
@@ -1135,8 +1135,8 @@ class TestWaitingLogSink : public LogSink {
   virtual void send(LogSeverity severity, const char* full_filename,
                     const char* base_filename, int line,
                     const struct tm* tm_time,
-                    const char* message, size_t, size_t message_len) {
-    send(severity, full_filename, base_filename, line, tm_time, message, message_len, 0);
+                    const char* message, size_t message_len) {
+    send(severity, full_filename, base_filename, line, tm_time, message, message_len);
   }
 
   virtual void WaitTillSent() {
