@@ -73,6 +73,10 @@
 # include "stacktrace.h"
 #endif
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 using std::string;
 using std::vector;
 using std::setw;
@@ -186,6 +190,9 @@ GLOG_DEFINE_bool(stop_logging_if_full_disk, false,
 
 GLOG_DEFINE_string(log_backtrace_at, "",
                    "Emit a backtrace when logging at file:linenum.");
+
+GLOG_DEFINE_bool(log_utc_time, false,
+    "Use UTC time for logging.");
 
 // TODO(hamaji): consider windows
 #define PATH_SEPARATOR '/'
@@ -450,12 +457,38 @@ class LogFileObject : public base::Logger {
   uint32 file_length_;
   unsigned int rollover_attempt_;
   int64 next_flush_time_;         // cycle count at which to flush log
+  WallTime start_time_;
 
   // Actually create a logfile using the value of base_filename_ and the
   // optional argument time_pid_string
   // REQUIRES: lock_ is held
   bool CreateLogfile(const string& time_pid_string);
 };
+
+// Encapsulate all log cleaner related states
+class LogCleaner {
+ public:
+  LogCleaner();
+  virtual ~LogCleaner() {}
+
+  void Enable(int overdue_days);
+  void Disable();
+  void Run(bool base_filename_selected, const string& base_filename) const;
+
+  inline bool enabled() const { return enabled_; }
+
+ private:
+  vector<string> GetOverdueLogNames(string log_directory, int days,
+                                    const string& base_filename) const;
+  bool IsLogFromCurrentProject(const string& filepath, const string& base_filename) const;
+  bool IsLogLastModifiedOver(const string& filepath, int days) const;
+ 
+  bool enabled_;
+  int overdue_days_;
+  char dir_delim_;  // filepath delimiter ('/' or '\\')
+};
+
+LogCleaner log_cleaner;
 
 }  // namespace
 
@@ -500,7 +533,7 @@ class LogDestination {
   // Take a log message of a particular severity and log it to stderr
   // iff it's of a high enough severity to deserve it.
   static void MaybeLogToStderr(LogSeverity severity, const char* message,
-			       size_t len);
+			       size_t message_len, size_t prefix_len);
 
   // Take a log message of a particular severity and log it to email
   // iff it's of a high enough severity to deserve it.
@@ -736,12 +769,23 @@ static void WriteToStderr(const char* message, size_t len) {
 }
 
 inline void LogDestination::MaybeLogToStderr(LogSeverity severity,
-					     const char* message, size_t len) {
+					     const char* message, size_t message_len, size_t prefix_len) {
   if ((severity >= FLAGS_stderrthreshold) || FLAGS_alsologtostderr) {
-    ColoredWriteToStderr(severity, message, len);
+    ColoredWriteToStderr(severity, message, message_len);
 #ifdef OS_WINDOWS
     // On Windows, also output to the debugger
-    ::OutputDebugStringA(string(message,len).c_str());
+    ::OutputDebugStringA(message);
+#elif defined(__ANDROID__)
+    // On Android, also output to logcat
+    const int android_log_levels[NUM_SEVERITIES] = {
+      ANDROID_LOG_INFO,
+      ANDROID_LOG_WARN,
+      ANDROID_LOG_ERROR,
+      ANDROID_LOG_FATAL,
+    };
+    __android_log_write(android_log_levels[severity],
+                        glog_internal_namespace_::ProgramInvocationShortName(),
+                        message + prefix_len);
 #endif
   }
 }
@@ -849,85 +893,27 @@ void LogDestination::DeleteLogDestinations() {
 
 namespace {
 
-bool IsGlogLog(const string& filename) {
-  // Check if filename matches the pattern of a glog file:
-  // "<program name>.<hostname>.<user name>.log...".
-  const int kKeywordCount = 4;
-  std::string keywords[kKeywordCount] = {
-    glog_internal_namespace_::ProgramInvocationShortName(),
-    LogDestination::hostname(),
-    MyUserName(),
-    "log"
-  };
-
-  int start_pos = 0;
-  for (int i = 0; i < kKeywordCount; i++) {
-    if (filename.find(keywords[i], start_pos) == filename.npos) {
-      return false;
-    }
-    start_pos += keywords[i].size() + 1;
-  }
-  return true;
-}
-
-bool LastModifiedOver(const string& filepath, int days) {
-  // Try to get the last modified time of this file.
-  struct stat file_stat;
-
-  if (stat(filepath.c_str(), &file_stat) == 0) {
-    // A day is 86400 seconds, so 7 days is 86400 * 7 = 604800 seconds.
-    time_t last_modified_time = file_stat.st_mtime;
-    time_t current_time = time(NULL);
-    return difftime(current_time, last_modified_time) > days * 86400;
-  }
-
-  // If failed to get file stat, don't return true!
-  return false;
-}
-
-vector<string> GetOverdueLogNames(string log_directory, int days) {
-  // The names of overdue logs.
-  vector<string> overdue_log_names;
-
-  // Try to get all files within log_directory.
-  DIR *dir;
-  struct dirent *ent;
-
-  char dir_delim = '/';
-#ifdef OS_WINDOWS
-  dir_delim = '\\';
-#endif
-
-  // If log_directory doesn't end with a slash, append a slash to it.
-  if (log_directory.at(log_directory.size() - 1) != dir_delim) {
-    log_directory += dir_delim;
-  }
-
-  if ((dir=opendir(log_directory.c_str()))) {
-    while ((ent=readdir(dir))) {
-      if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
-        continue;
-      }
-      string filepath = log_directory + ent->d_name;
-      if (IsGlogLog(ent->d_name) && LastModifiedOver(filepath, days)) {
-        overdue_log_names.push_back(filepath);
-      }
-    }
-    closedir(dir);
-  }
-
-  return overdue_log_names;
-}
-
-// Is log_cleaner enabled?
-// This option can be enabled by calling google::EnableLogCleaner(days)
-bool log_cleaner_enabled_;
-int log_cleaner_overdue_days_ = 7;
+std::string g_application_fingerprint;
 
 } // namespace
 
+void SetApplicationFingerprint(const std::string& fingerprint) {
+  g_application_fingerprint = fingerprint;
+}
 
 namespace {
+
+string PrettyDuration(int secs) {
+  std::stringstream result;
+  int mins = secs / 60;
+  int hours = mins / 60;
+  mins = mins % 60;
+  secs = secs % 60;
+  result.fill('0');
+  result << hours << ':' << setw(2) << mins << ':' << setw(2) << secs;
+  return result.str();
+}
+
 
 LogFileObject::LogFileObject(LogSeverity severity,
                              const char* base_filename)
@@ -941,7 +927,8 @@ LogFileObject::LogFileObject(LogSeverity severity,
     dropped_mem_length_(0),
     file_length_(0),
     rollover_attempt_(kRolloverAttemptFrequency-1),
-    next_flush_time_(0) {
+    next_flush_time_(0),
+    start_time_(WallTime_Now()) {
   assert(severity >= 0);
   assert(severity < NUM_SEVERITIES);
 }
@@ -1130,7 +1117,10 @@ void LogFileObject::Write(bool force_flush,
     rollover_attempt_ = 0;
 
     struct ::tm tm_time;
-    localtime_r(&timestamp, &tm_time);
+    if (FLAGS_log_utc_time)
+        gmtime_r(&timestamp, &tm_time);
+    else
+        localtime_r(&timestamp, &tm_time);
 
     // The logfile's filename will have the date/time & pid in it
     ostringstream time_pid_stream;
@@ -1214,9 +1204,16 @@ void LogFileObject::Write(bool force_flush,
                        << ' '
                        << setw(2) << tm_time.tm_hour << ':'
                        << setw(2) << tm_time.tm_min << ':'
-                       << setw(2) << tm_time.tm_sec << '\n'
+                       << setw(2) << tm_time.tm_sec << (FLAGS_log_utc_time ? " UTC\n" : "\n")
                        << "Running on machine: "
-                       << LogDestination::hostname() << '\n'
+                       << LogDestination::hostname() << '\n';
+
+    if(!g_application_fingerprint.empty()) {
+      file_header_stream << "Application fingerprint: " << g_application_fingerprint << '\n';
+    }
+
+    file_header_stream << "Running duration (h:mm:ss): "
+                       << PrettyDuration(static_cast<int>(WallTime_Now() - start_time_)) << '\n'
                        << "Log line format: [IWEF]yyyymmdd hh:mm:ss.uuuuuu "
                        << "threadid file:line] msg" << '\n';
     const string& file_header_string = file_header_stream.str();
@@ -1277,16 +1274,147 @@ void LogFileObject::Write(bool force_flush,
     }
 #endif
     // Perform clean up for old logs
-    if (log_cleaner_enabled_) {
-      const vector<string>& dirs = GetLoggingDirectories();
-      for (size_t i = 0; i < dirs.size(); i++) {
-        vector<string> logs = GetOverdueLogNames(dirs[i], log_cleaner_overdue_days_);
-        for (size_t j = 0; j < logs.size(); j++) {
-          static_cast<void>(unlink(logs[j].c_str()));
-        }
+    if (log_cleaner.enabled()) {
+      if (base_filename_selected_ && base_filename_.empty()) {
+        return;
       }
+      log_cleaner.Run(base_filename_selected_, base_filename_);
     }
   }
+}
+
+
+LogCleaner::LogCleaner() : enabled_(false), overdue_days_(7), dir_delim_('/') {
+#ifdef OS_WINDOWS
+  dir_delim_ = '\\';
+#endif
+}
+
+void LogCleaner::Enable(int overdue_days) {
+  // Setting overdue_days to 0 day should not be allowed!
+  // Since all logs will be deleted immediately, which will cause troubles.
+  assert(overdue_days > 0);
+
+  enabled_ = true;
+  overdue_days_ = overdue_days;
+}
+
+void LogCleaner::Disable() {
+  enabled_ = false;
+}
+
+void LogCleaner::Run(bool base_filename_selected, const string& base_filename) const {
+  assert(enabled_ && overdue_days_ > 0);
+
+  vector<string> dirs;
+
+  if (base_filename_selected) {
+    string dir = base_filename.substr(0, base_filename.find_last_of(dir_delim_) + 1);
+    dirs.push_back(dir);
+  } else {
+    dirs = GetLoggingDirectories();
+  }
+
+  for (size_t i = 0; i < dirs.size(); i++) {
+    vector<string> logs = GetOverdueLogNames(dirs[i], overdue_days_, base_filename);
+    for (size_t j = 0; j < logs.size(); j++) {
+      static_cast<void>(unlink(logs[j].c_str()));
+    }
+  }
+}
+
+vector<string> LogCleaner::GetOverdueLogNames(string log_directory, int days,
+                                              const string& base_filename) const {
+  // The names of overdue logs.
+  vector<string> overdue_log_names;
+
+  // Try to get all files within log_directory.
+  DIR *dir;
+  struct dirent *ent;
+
+  // If log_directory doesn't end with a slash, append a slash to it.
+  if (log_directory.at(log_directory.size() - 1) != dir_delim_) {
+    log_directory += dir_delim_;
+  }
+
+  if ((dir=opendir(log_directory.c_str()))) {
+    while ((ent=readdir(dir))) {
+      if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) {
+        continue;
+      }
+      string filepath = log_directory + ent->d_name;
+      if (IsLogFromCurrentProject(filepath, base_filename) &&
+          IsLogLastModifiedOver(filepath, days)) {
+        overdue_log_names.push_back(filepath);
+      }
+    }
+    closedir(dir);
+  }
+
+  return overdue_log_names;
+}
+
+bool LogCleaner::IsLogFromCurrentProject(const string& filepath,
+                                         const string& base_filename) const {
+  // We should remove duplicated delimiters from `base_filename`, e.g.,
+  // before: "/tmp//<base_filename>.<create_time>.<pid>"
+  // after:  "/tmp/<base_filename>.<create_time>.<pid>"
+  string cleaned_base_filename;
+
+  for (size_t i = 0; i < base_filename.size(); ++i) {
+    const char& c = base_filename[i];
+
+    if (cleaned_base_filename.empty()) {
+      cleaned_base_filename += c;
+    } else if (c != dir_delim_ ||
+        c != cleaned_base_filename.at(cleaned_base_filename.size() - 1)) {
+      cleaned_base_filename += c;
+    }
+  }
+
+  // Return early if the filename doesn't start with `cleaned_base_filename`.
+  if (filepath.find(cleaned_base_filename) != 0) {
+    return false;
+  }
+
+  // The characters after `cleaned_base_filename` should match the format:
+  // YYYYMMDD-HHMMSS.pid
+  for (size_t i = cleaned_base_filename.size(); i < filepath.size(); i++) {
+    const char& c = filepath[i];
+
+    if (i <= cleaned_base_filename.size() + 7) { // 0 ~ 7 : YYYYMMDD
+      if (c < '0' || c > '9') { return false; }
+
+    } else if (i == cleaned_base_filename.size() + 8) { // 8: -
+      if (c != '-') { return false; }
+
+    } else if (i <= cleaned_base_filename.size() + 14) { // 9 ~ 14: HHMMSS
+      if (c < '0' || c > '9') { return false; }
+
+    } else if (i == cleaned_base_filename.size() + 15) { // 15: .
+      if (c != '.') { return false; }
+
+    } else if (i >= cleaned_base_filename.size() + 16) { // 16+: pid
+      if (c < '0' || c > '9') { return false; }
+    }
+  }
+
+  return true;
+}
+
+bool LogCleaner::IsLogLastModifiedOver(const string& filepath, int days) const {
+  // Try to get the last modified time of this file.
+  struct stat file_stat;
+
+  if (stat(filepath.c_str(), &file_stat) == 0) {
+    // A day is 86400 seconds, so 7 days is 86400 * 7 = 604800 seconds.
+    time_t last_modified_time = file_stat.st_mtime;
+    time_t current_time = time(NULL);
+    return difftime(current_time, last_modified_time) > days * 86400;
+  }
+
+  // If failed to get file stat, don't return true!
+  return false;
 }
 
 }  // namespace
@@ -1419,7 +1547,10 @@ void LogMessage::Init(const char* file,
   data_->outvec_ = NULL;
   WallTime now = WallTime_Now();
   data_->timestamp_ = static_cast<time_t>(now);
-  localtime_r(&data_->timestamp_, &data_->tm_time_);
+  if(FLAGS_log_utc_time)
+    gmtime_r(&data_->timestamp_, &data_->tm_time_);
+  else
+    localtime_r(&data_->timestamp_, &data_->tm_time_);
   data_->usecs_ = static_cast<int32>((now - data_->timestamp_) * 1000000);
 
   data_->num_chars_to_log_ = 0;
@@ -1486,6 +1617,23 @@ ostream& LogMessage::stream() {
   return data_->stream_;
 }
 
+namespace {
+#if defined(__ANDROID__)
+int AndroidLogLevel(const int severity) {
+  switch (severity) {
+    case 3:
+      return ANDROID_LOG_FATAL;
+    case 2:
+      return ANDROID_LOG_ERROR;
+    case 1:
+      return ANDROID_LOG_WARN;
+    default:
+      return ANDROID_LOG_INFO;
+  }
+}
+#endif  // defined(__ANDROID__)
+}  // namespace	
+
 // Flush buffered message, called by the destructor, or any other function
 // that needs to synchronize the log.
 void LogMessage::Flush() {
@@ -1510,6 +1658,7 @@ void LogMessage::Flush() {
     original_final_char = data_->message_text_[data_->num_chars_to_log_];
     data_->message_text_[data_->num_chars_to_log_++] = '\n';
   }
+  data_->message_text_[data_->num_chars_to_log_] = '\0';
 
   // Prevent any subtle race conditions by wrapping a mutex lock around
   // the actual logging action per se.
@@ -1519,7 +1668,13 @@ void LogMessage::Flush() {
     ++num_messages_[static_cast<int>(data_->severity_)];
   }
   LogDestination::WaitForSinks(data_);
-
+	
+#if defined(__ANDROID__)
+  const int level = AndroidLogLevel((int)data_->severity_);
+  const std::string text = std::string(data_->message_text_);
+  __android_log_write(level, "native", text.substr(0,data_->num_chars_to_log_).c_str());
+#endif  // !defined(__ANDROID__)
+	
   if (append_newline) {
     // Fix the ostrstream back how it was before we screwed with it.
     // It's 99.44% certain that we don't need to worry about doing this.
@@ -1598,7 +1753,8 @@ void LogMessage::SendToLog() EXCLUSIVE_LOCKS_REQUIRED(log_mutex) {
                                      data_->num_chars_to_log_);
 
     LogDestination::MaybeLogToStderr(data_->severity_, data_->message_text_,
-                                     data_->num_chars_to_log_);
+                                     data_->num_chars_to_log_,
+                                     data_->num_prefix_chars_);
     LogDestination::MaybeLogToEmail(data_->severity_, data_->message_text_,
                                     data_->num_chars_to_log_);
     LogDestination::LogToSinks(data_->severity_,
@@ -2329,17 +2485,11 @@ void ShutdownGoogleLogging() {
 }
 
 void EnableLogCleaner(int overdue_days) {
-  log_cleaner_enabled_ = true;
-
-  // Setting overdue_days to 0 day should not be allowed!
-  // Since all logs will be deleted immediately, which will cause troubles.
-  if (overdue_days > 0) {
-    log_cleaner_overdue_days_ = overdue_days;
-  }
+  log_cleaner.Enable(overdue_days);
 }
 
 void DisableLogCleaner() {
-  log_cleaner_enabled_ = false;
+  log_cleaner.Disable();
 }
 
 _END_GOOGLE_NAMESPACE_

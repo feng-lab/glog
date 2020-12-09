@@ -570,6 +570,10 @@ if (gflags_FOUND)
   endif (NOT BUILD_SHARED_LIBS)
 endif (gflags_FOUND)
 
+if (ANDROID)
+  target_link_libraries (glog PUBLIC log)
+endif()
+
 set_target_properties (glog PROPERTIES VERSION ${PROJECT_VERSION})
 set_target_properties (glog PROPERTIES SOVERSION ${PROJECT_VERSION_MAJOR})
 
@@ -821,7 +825,7 @@ configure_file (glog-modules.cmake.in
 install (CODE
 "
 set (glog_FULL_CMake_DATADIR \"\\\${CMAKE_CURRENT_LIST_DIR}/${glog_REL_CMake_DATADIR}\")
-configure_file (${CMAKE_CURRENT_SOURCE_DIR}/glog-modules.cmake.in
+configure_file (\"${CMAKE_CURRENT_SOURCE_DIR}/glog-modules.cmake.in\"
   \"${CMAKE_CURRENT_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/CMakeTmp/glog-modules.cmake\" @ONLY)
 file (INSTALL
   \"${CMAKE_CURRENT_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/CMakeTmp/glog-modules.cmake\"

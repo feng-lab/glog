@@ -381,6 +381,9 @@ DECLARE_int32(max_log_size);
 // Sets whether to avoid logging to the disk if the disk is full.
 DECLARE_bool(stop_logging_if_full_disk);
 
+// Use UTC time for logging.
+DECLARE_bool(log_utc_time);
+
 #ifdef MUST_UNDEF_GFLAGS_DECLARE_MACROS
 #undef MUST_UNDEF_GFLAGS_DECLARE_MACROS
 #undef DECLARE_VARIABLE
@@ -1129,7 +1132,7 @@ class GOOGLE_GLOG_DLL_DECL LogStreamBuf : public std::streambuf {
   }
 
   // This effectively ignores overflow.
-  virtual int_type overflow(int_type ch) {
+  int_type overflow(int_type ch) {
     return ch;
   }
 
